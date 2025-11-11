@@ -1,8 +1,13 @@
+import os
+# Force Streamlit to use polling watcher to avoid inotify limit on Streamlit Cloud
+os.environ["STREAMLIT_SERVER_FILE_WATCHER_TYPE"] = "poll"
+
 import io, re
 import pandas as pd
 import streamlit as st
 from datetime import datetime
 import pytz
+
 
 # ------------------------------
 # App config
