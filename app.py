@@ -354,6 +354,20 @@ if run:
                 ws2.write(r + 1, col_idx[src_col], val, ok_fmt if val == "✅" else bad_fmt)
 
     st.success("Done — download your Excel below.")
+    from datetime import datetime
+
+# Generate timestamp prefix: YYMMDD_HHMM
+timestamp = datetime.now().strftime("%y%m%d_%H%M")
+
+# Update the file name with timestamp
+file_name = f"{timestamp}_Master_Students_Combined_LENIENT_WITH_SUMMARY.xlsx"
+
+st.download_button(
+    label=f"⬇️ Download {file_name}",
+    data=output.getvalue(),
+    file_name=file_name,
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)
     st.download_button(
         label="⬇️ Download Master_Students_Combined_LENIENT_WITH_SUMMARY.xlsx",
         data=output.getvalue(),
