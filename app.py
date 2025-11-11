@@ -4,7 +4,7 @@ import pandas as pd
 import streamlit as st
 
 # ──────────────────────────────────────────────────────────────────────────────
-# PAGE CONFIG  (must be the first Streamlit call, and only once)
+# PAGE CONFIG (must be first Streamlit call, and only once)
 # ──────────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Roster → Master (LENIENT)", page_icon="📘", layout="centered")
 
@@ -15,7 +15,6 @@ st.caption("Upload Blackbaud, Rediker, and Student Records → get a styled Exce
 # NORMALIZATION HELPERS
 # ──────────────────────────────────────────────────────────────────────────────
 def norm_piece(s: str) -> str:
-    # Allow letters, digits, spaces, hyphens; uppercase; trim
     return re.sub(r"[^A-Z0-9 \-]+", "", str(s).upper()).strip()
 
 def grade_norm(s: str) -> str:
@@ -34,13 +33,11 @@ def grade_norm(s: str) -> str:
     return x
 
 def surname_last_token(last: str) -> str:
-    # Use the LAST token of the last name to handle compound surnames (e.g., ABREU RAMIREZ → RAMIREZ)
     s = norm_piece(last).replace("-", " ")
     toks = [t for t in s.split() if t]
     return toks[-1] if toks else ""
 
 def firstname_first_token(first: str, last: str) -> str:
-    # Prefer first token of FIRST name; if missing, fall back to first token of LAST
     ftoks = [t for t in norm_piece(first).split() if t]
     if ftoks:
         return ftoks[0]
@@ -51,11 +48,44 @@ def make_unique_key_lenient(first: str, last: str, grade: str) -> str:
     return f"{surname_last_token(last)}|{firstname_first_token(first, last)}|{grade_norm(grade)}"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# BLACKBAUD PARSER (robust header detection, splits "Student name (GRADE)" list)
+# GENERIC COLUMN-FINDING UTILITIES
+# ──────────────────────────────────────────────────────────────────────────────
+def upper_cols(df):
+    return {str(c).strip().upper(): c for c in df.columns}
+
+def find_any(df, *need_tokens):
+    """
+    Return first column whose UPPER header contains ALL tokens in any of the
+    provided token-tuples. Example:
+      find_any(df, ("PARENT","FIRST"), ("PARENT 1","FIRST"), ("GUARDIAN","FIRST"))
+    """
+    U = upper_cols(df)
+    for cand in df.columns:
+        up = str(cand).strip().upper()
+        for token_tuple in need_tokens:
+            if all(tok in up for tok in token_tuple):
+                return cand
+    return None
+
+def find_student_grade_blob_column(df):
+    # Prefer columns that explicitly include both STUDENT and GRADE
+    for c in df.columns:
+        up = str(c).strip().upper()
+        if "STUDENT" in up and "GRADE" in up:
+            return c
+    # Fallback: a column with many "(...)" endings (e.g., "LAST, FIRST (K)")
+    scores = {c: df[c].astype(str).str.contains(r"\([^)]+\)\s*$", regex=True).sum() for c in df.columns}
+    if not scores:
+        return None
+    best = max(scores, key=scores.get)
+    return best if scores[best] >= 3 else None
+
+# ──────────────────────────────────────────────────────────────────────────────
+# BLACKBAUD PARSER (robust header detection; parent columns OPTIONAL)
 # ──────────────────────────────────────────────────────────────────────────────
 def parse_blackbaud(file) -> pd.DataFrame:
-    # Detect header row in first 20 lines
-    probe = pd.read_excel(file, header=None, nrows=20)
+    # Detect header row in first 25 lines
+    probe = pd.read_excel(file, header=None, nrows=25)
     want = ["FAMILY", "ID", "PARENT", "FIRST", "LAST", "STUDENT", "GRADE"]
     best_row, best_hits = 0, -1
     for i in range(len(probe)):
@@ -64,54 +94,50 @@ def parse_blackbaud(file) -> pd.DataFrame:
         if hits > best_hits:
             best_row, best_hits = i, hits
 
-    # Read using detected header; do NOT limit to A–E (some exports shift columns)
     df = pd.read_excel(file, header=best_row).fillna("")
-    df.columns = [str(c).strip().upper() for c in df.columns]
+    df.columns = [str(c).strip() for c in df.columns]
 
     # Flexible column finding
-    col_fam = next((c for c in df.columns if "FAMILY" in c and "ID" in c), None)
-    col_pf  = next((c for c in df.columns if "PARENT" in c and "FIRST" in c), None)
-    col_pl  = next((c for c in df.columns if "PARENT" in c and "LAST"  in c), None)
+    fam_col = find_any(df, ("FAMILY","ID"))
+    # Parent FIRST/LAST: accept broad variants and make OPTIONAL
+    pf_col = find_any(
+        df, ("PARENT","FIRST"),
+        ("PARENT 1","FIRST"), ("P1","FIRST"),
+        ("PRIMARY","PARENT","FIRST"),
+        ("GUARDIAN","FIRST"),
+        ("CONTACT 1","FIRST"), ("CONTACT1","FIRST")
+    )
+    pl_col = find_any(
+        df, ("PARENT","LAST"),
+        ("PARENT 1","LAST"), ("P1","LAST"),
+        ("PRIMARY","PARENT","LAST"),
+        ("GUARDIAN","LAST"),
+        ("CONTACT 1","LAST"), ("CONTACT1","LAST")
+    )
+    stu_blob_col = find_student_grade_blob_column(df)
 
-    # The student+grade column is a blob like "LAST, FIRST (K); OTHER, CHILD (1)"
-    col_stu = next((c for c in df.columns if "STUDENT" in c and "GRADE" in c), None)
-    if not col_stu:
-        # Fallback: any column with many "(...)" grade suffixes
-        candidate_counts = {c: df[c].astype(str).str.contains(r"\([^)]+\)\s*$", regex=True).sum() for c in df.columns}
-        # pick the column with the most "(...)" endings if above a small threshold
-        col_stu = max(candidate_counts, key=candidate_counts.get) if candidate_counts else None
-        if candidate_counts.get(col_stu, 0) < 3:  # too few matches → probably wrong
-            col_stu = None
-
-    missing = [n for n, v in {
-        "Family ID": col_fam,
-        "Parent First": col_pf,
-        "Parent Last": col_pl,
-        "Student(+Grade) list": col_stu,
-    }.items() if not v]
-    if missing:
-        st.error(f"Blackbaud: couldn’t find column(s): {', '.join(missing)}. Please check headers.")
+    # Only the student blob is truly required for rows; FamilyID helps but can be missing.
+    if not stu_blob_col:
+        st.error("Blackbaud: couldn’t find the student + (grade) column. Please check your export.")
         st.stop()
 
+    # Prepare simple parsing helpers
     def split_students(cell: str):
         if pd.isna(cell) or str(cell).strip() == "":
             return []
-        text = re.sub(r"\s*\)\s*[,/;|]?\s*", ")|", str(cell))  # normalize separators after ')'
+        text = re.sub(r"\s*\)\s*[,/;|]?\s*", ")|", str(cell))
         return [p.strip().rstrip(",;/|") for p in text.split("|") if p.strip()]
 
     def parse_student_entry(entry: str):
-        # Extract trailing (GRADE)
         m = re.search(r"\(([^)]+)\)\s*$", entry)
         grade = m.group(1).strip() if m else ""
         name = re.sub(r"\([^)]+\)\s*$", "", entry).strip()
-        # Decide LAST, FIRST
         if ";" in name:
             last, first = [t.strip() for t in name.split(";", 1)]
         elif "," in name:
             last, first = [t.strip() for t in name.split(",", 1)]
         else:
             toks = name.split()
-            # For names without a comma: assume 1st token is LAST, the rest is FIRST (handles multi-given names)
             if len(toks) >= 3:
                 last, first = toks[0], " ".join(toks[1:])
             elif len(toks) == 2:
@@ -122,10 +148,10 @@ def parse_blackbaud(file) -> pd.DataFrame:
 
     rows = []
     for _, r in df.iterrows():
-        fam = str(r.get(col_fam, "")).replace(".0", "").strip()
-        pf  = str(r.get(col_pf, "")).strip()
-        pl  = str(r.get(col_pl, "")).strip()
-        for entry in split_students(r.get(col_stu, "")):
+        fam = str(r.get(fam_col, "")).replace(".0","").strip() if fam_col else ""
+        pf  = str(r.get(pf_col,  "")).strip() if pf_col else ""
+        pl  = str(r.get(pl_col,  "")).strip() if pl_col else ""
+        for entry in split_students(r.get(stu_blob_col, "")):
             l, f, g = parse_student_entry(entry)
             rows.append({
                 "ID": "",
@@ -139,13 +165,17 @@ def parse_blackbaud(file) -> pd.DataFrame:
                 "SOURCE": "BB",
                 "UNIQUE_KEY": make_unique_key_lenient(f, l, g),
             })
+
+    # If parent columns were missing, inform but do not stop.
+    if not pf_col or not pl_col:
+        st.warning("Blackbaud: Parent First/Last columns not found. Proceeding with blanks for those fields.")
+
     return pd.DataFrame(rows)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# REDIKER PARSER (robust to header variants; guards for required columns)
+# REDIKER PARSER (robust; required cols guarded)
 # ──────────────────────────────────────────────────────────────────────────────
 def parse_rediker(file) -> pd.DataFrame:
-    # Detect header row quickly (look for typical words)
     probe = pd.read_excel(file, header=None, nrows=12, usecols="A:K")
     tokens = {"APID","UNIQUE","STUDENT","FIRST","LAST","GRADE","LEVEL","GR","FAMILY","ID"}
     best_row, best_hits = 0, -1
@@ -157,7 +187,7 @@ def parse_rediker(file) -> pd.DataFrame:
 
     df = pd.read_excel(file, header=best_row, usecols="A:K").fillna("")
     df.columns = [str(c).strip() for c in df.columns]
-    U = {c.upper(): c for c in df.columns}
+    U = upper_cols(df)
 
     first_col = next((U[k] for k in U if k in ("FIRST","FIRST NAME","FIRST_NAME","STUDENT FIRST NAME")), None)
     last_col  = next((U[k] for k in U if k in ("LAST","LAST NAME","LAST_NAME","STUDENT LAST NAME")), None)
@@ -179,13 +209,11 @@ def parse_rediker(file) -> pd.DataFrame:
             last, first = (parts[0], " ".join(parts[1:])) if len(parts) >= 2 else (s, "")
         return first, last
 
-    # If FIRST/LAST not present, try to split NAME
     if not (first_col and last_col) and name_col:
         split = df[name_col].apply(split_student_name).tolist()
         df["__First"], df["__Last"] = zip(*split) if split else ([], [])
         first_col, last_col = "__First", "__Last"
 
-    # Guard required cols
     required = {"FIRST name": first_col, "LAST name": last_col, "GRADE": grade_col}
     missing = [k for k, v in required.items() if not v]
     if missing:
@@ -214,11 +242,11 @@ def parse_rediker(file) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# STUDENT RECORDS PARSER (guards for required cols; flexible IDs/parents)
+# STUDENT RECORDS PARSER (guards for required; flexible IDs/parents)
 # ──────────────────────────────────────────────────────────────────────────────
 def parse_student_records(file) -> pd.DataFrame:
     df = pd.read_excel(file).fillna("")
-    U = {str(c).strip().upper(): c for c in df.columns}
+    U = upper_cols(df)
 
     col_id   = list(df.columns)[0] if len(df.columns) else None
     col_fam  = U.get("FAMILY ID") or U.get("FAMILYID") or U.get("FAMILY_ID")
@@ -277,7 +305,7 @@ if run:
     ]
     master = pd.concat([bb_df[TARGET], red_df[TARGET], sr_df[TARGET]], ignore_index=True)
 
-    # Build helpers for lenient grouping/presence (FIXED: LAST surname token)
+    # Build helpers for lenient grouping/presence (LAST surname token)
     master["__SURNAME_TOKEN"] = master["STUDENT LAST NAME"].apply(surname_last_token)
     master["__FIRSTTOK"]      = master.apply(lambda r: firstname_first_token(r["STUDENT FIRST NAME"], r["STUDENT LAST NAME"]), axis=1)
     master["__GRADELEN"]      = master["GRADE"].apply(grade_norm)
@@ -289,7 +317,6 @@ if run:
     # Sort by key then source
     order = {"BB":0, "RED":1, "SR":2}
     master["_source_rank"] = master["SOURCE"].map(lambda x: order.get(str(x).upper(), 99))
-    # Rebuild UNIQUE_KEY to reflect fixed surname token & normalized grade
     master["UNIQUE_KEY"] = master["__SURNAME_TOKEN"] + "|" + master["__FIRSTTOK"] + "|" + master["__GRADELEN"]
     master_sorted = master.sort_values(by=["UNIQUE_KEY","_source_rank","STUDENT LAST NAME","STUDENT FIRST NAME"], kind="mergesort").reset_index(drop=True)
 
@@ -314,12 +341,10 @@ if run:
         })
     summary = pd.DataFrame(summary_rows).sort_values(["SURNAME_TOKEN(LAST)","GRADE","FIRST_TOKEN"]).reset_index(drop=True)
 
-    # DIAGNOSTICS (so you can verify the detected columns and sample keys)
-    with st.expander("Diagnostics (detected headers and sample keys)"):
-        st.write("Blackbaud detected rows:", len(bb_df))
-        st.write("Rediker detected rows:", len(red_df))
-        st.write("Student Records detected rows:", len(sr_df))
-        st.dataframe(master_sorted[["SOURCE","STUDENT LAST NAME","STUDENT FIRST NAME","GRADE","UNIQUE_KEY"]].head(15))
+    # DIAGNOSTICS
+    with st.expander("Diagnostics (detected rows & sample keys)"):
+        st.write("Blackbaud rows:", len(bb_df), "Rediker rows:", len(red_df), "Student Records rows:", len(sr_df))
+        st.dataframe(master_sorted[["SOURCE","FAMILY ID","PARENT FIRST NAME","PARENT LAST NAME","STUDENT LAST NAME","STUDENT FIRST NAME","GRADE","UNIQUE_KEY"]].head(20))
 
     # WRITE EXCEL (+ styling)
     import xlsxwriter
