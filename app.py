@@ -176,8 +176,9 @@ def parse_blackbaud(file) -> pd.DataFrame:
 # REDIKER PARSER (robust; required cols guarded)
 # ──────────────────────────────────────────────────────────────────────────────
 def parse_rediker(file) -> pd.DataFrame:
+    # Try to find a plausible header row first
     probe = pd.read_excel(file, header=None, nrows=12, usecols="A:K")
-    tokens = {"APID","UNIQUE","STUDENT","FIRST","LAST","GRADE","LEVEL","GR","FAMILY","ID"}
+    tokens = {"APID","UNIQUE","STUDENT","FIRST","LAST","GRADE","LEVEL","GR","FAMILY","ID","HOMEROOM","SECTION","CLASS","HR"}
     best_row, best_hits = 0, -1
     for i in range(len(probe)):
         row_vals = [str(x).strip().upper() for x in probe.iloc[i].tolist()]
@@ -186,16 +187,32 @@ def parse_rediker(file) -> pd.DataFrame:
             best_row, best_hits = i, hits
 
     df = pd.read_excel(file, header=best_row, usecols="A:K").fillna("")
+    # Normalize headers but keep originals for access
+    orig_cols = list(df.columns)
     df.columns = [str(c).strip() for c in df.columns]
-    U = upper_cols(df)
+    U = {c.upper().strip(): c for c in df.columns}
 
+    # Name columns
     first_col = next((U[k] for k in U if k in ("FIRST","FIRST NAME","FIRST_NAME","STUDENT FIRST NAME")), None)
     last_col  = next((U[k] for k in U if k in ("LAST","LAST NAME","LAST_NAME","STUDENT LAST NAME")), None)
     name_col  = next((U[k] for k in U if k in ("STUDENT NAME","STUDENT_NAME","NAME")), None)
-    grade_col = next((U[k] for k in U if k in ("GRADE","GRADE LEVEL","GR")), None)
-    fam_col   = next((U[k] for k in U if "FAMILY" in k and "ID" in k), None)
-    rid_col   = next((U[k] for k in U if k in ("APID","UNIQUE ID","UNIQUE_ID","REDIKER ID","REDIKERID","ID") and U[k] != fam_col), None)
 
+    # Grade columns — accept many variants & whitespace
+    grade_keys = (
+        "GRADE","GRADE LEVEL","GRADELEVEL","GR","GR LEVEL","GRLEVEL","GRADE_LVL",
+        "GRADE(LVL)","GRADE (LEVEL)","CURRENT GRADE","CUR GRADE","LVL"
+    )
+    grade_col = None
+    for k in U:
+        kk = " ".join(k.split())  # collapse extra spaces
+        if kk in grade_keys or ("GRADE" in kk and "FAMILY" not in kk):
+            grade_col = U[k]; break
+
+    # Family & Rediker IDs
+    fam_col = next((U[k] for k in U if "FAMILY" in k and "ID" in k), None)
+    rid_col = next((U[k] for k in U if k in ("APID","UNIQUE ID","UNIQUE_ID","REDIKER ID","REDIKERID","ID") and U[k] != fam_col), None)
+
+    # If FIRST/LAST aren’t present, try to split a single NAME column
     def split_student_name(val: str):
         if pd.isna(val) or str(val).strip() == "":
             return "", ""
@@ -214,19 +231,78 @@ def parse_rediker(file) -> pd.DataFrame:
         df["__First"], df["__Last"] = zip(*split) if split else ([], [])
         first_col, last_col = "__First", "__Last"
 
-    required = {"FIRST name": first_col, "LAST name": last_col, "GRADE": grade_col}
+    # --- Try to infer grade if a clear grade column was not found ---
+    inferred_grade = None
+    if not grade_col:
+        # Look for likely columns to mine: HOMEROOM / HR / SECTION / CLASS
+        likely_grade_sources = []
+        for c in df.columns:
+            up = c.upper()
+            if any(key in up for key in ("HOMEROOM","HOMEROOM#", "HR", "SECTION","CLASS","GRADE")):
+                likely_grade_sources.append(c)
+
+        def guess_grade_from_text(s: str) -> str:
+            if not s or str(s).strip()=="":
+                return ""
+            t = norm_piece(s)
+            # Common patterns: "1A", "1-B", "GR 2", "GRADE 3", "PK4", "PK 4", "K", "KINDERGARTEN"
+            # 1) PK3/PK4 variants
+            if re.search(r"\bP\s*3\b|PK\s*3\b|PRE[-\s]*K\s*3\b|PREK\s*3\b", t):
+                return "PK3"
+            if re.search(r"\bP\s*4\b|PK\s*4\b|PRE[-\s]*K\s*4\b|PREK\s*4\b", t):
+                return "PK4"
+            # 2) Kindergarten
+            if re.search(r"\bK(\b|INDER)", t):
+                return "K"
+            # 3) Grades 1–12
+            m = re.search(r"\b(?:GR|GRADE|G)?\s*([1-9]|1[0-2])\b", t)
+            if m:
+                return str(int(m.group(1)))
+            # 4) Suffix forms like "1A" "2-B"
+            m = re.search(r"\b([1-9]|1[0-2])\s*[-]?[A-Z]\b", t)
+            if m:
+                return str(int(m.group(1)))
+            return ""
+
+        # Build an inferred grade Series, prioritizing first source with good hit rate
+        for c in likely_grade_sources:
+            series_guess = df[c].astype(str).apply(guess_grade_from_text)
+            hit_ratio = (series_guess != "").mean()
+            if hit_ratio >= 0.25:  # at least 25% of rows yield a grade → good enough
+                inferred_grade = series_guess
+                break
+
+        if inferred_grade is None:
+            # last resort: scan any column for embedded grade cues
+            for c in df.columns:
+                series_guess = df[c].astype(str).apply(guess_grade_from_text)
+                if (series_guess != "").mean() >= 0.25:
+                    inferred_grade = series_guess
+                    break
+
+        if inferred_grade is None:
+            st.warning("Rediker: no GRADE column found and could not infer grades. Proceeding with blanks.")
+        else:
+            st.info("Rediker: GRADE column not found; grades inferred from other columns.")
+
+    # --- Guard required name columns (we’ll proceed even if grade is blank) ---
+    required = {"FIRST name": first_col, "LAST name": last_col}
     missing = [k for k, v in required.items() if not v]
     if missing:
         st.error(f"Rediker: couldn’t find required column(s): {', '.join(missing)}.")
         st.stop()
 
+    # Build rows
     rows = []
     for _, r in df.iterrows():
         fam   = str(r.get(fam_col, "")).replace(".0","").strip() if fam_col else ""
         rid   = str(r.get(rid_col, "")).replace(".0","").strip() if rid_col else ""
         first = str(r.get(first_col, "")).strip() if first_col else ""
         last  = str(r.get(last_col,  "")).strip() if last_col  else ""
-        grade = str(r.get(grade_col, "")).strip() if grade_col else ""
+        if grade_col:
+            grade = str(r.get(grade_col, "")).strip()
+        else:
+            grade = str(inferred_grade.loc[_]).strip() if inferred_grade is not None else ""
         rows.append({
             "ID": "",
             "FAMILY ID": fam,
@@ -239,6 +315,11 @@ def parse_rediker(file) -> pd.DataFrame:
             "SOURCE": "RED",
             "UNIQUE_KEY": make_unique_key_lenient(first, last, grade),
         })
+
+    # If no concrete grade column and few/none inferred, warn once more
+    if not grade_col and (inferred_grade is None or (pd.Series([r["GRADE"] for r in rows]) == "").mean() > 0.5):
+        st.warning("Rediker: more than half the rows have blank grades; cross-source matching may be less reliable.")
+
     return pd.DataFrame(rows)
 
 # ──────────────────────────────────────────────────────────────────────────────
