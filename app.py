@@ -20,9 +20,9 @@ def grade_norm(s: str) -> str:
     x = norm_piece(s)
     x = re.sub(r"\s+", "", x)  # collapse spaces
     aliases = {
-        "P4":"PK4", "PK":"PK4", "PREK":"PK4", "PREK4":"PK4", "PRE-K":"PK4", "PRE-K4":"PK4",
-        "P3":"PK3", "PREK3":"PK3", "PRE-K3":"PK3",
-        "KINDERGARTEN":"K", "KINDER":"K", "KG":"K"
+        "P4": "PK4", "PK": "PK4", "PREK": "PK4", "PREK4": "PK4", "PRE-K": "PK4", "PRE-K4": "PK4",
+        "P3": "PK3", "PREK3": "PK3", "PRE-K3": "PK3",
+        "KINDERGARTEN": "K", "KINDER": "K", "KG": "K"
     }
     if x in aliases:
         return aliases[x]
@@ -174,7 +174,7 @@ def parse_student_records(file) -> pd.DataFrame:
     col_sf  = U.get("CHILD FIRST NAME") or U.get("STUDENT FIRST NAME") or U.get("FIRST NAME") or U.get("FIRST")
     col_sl  = U.get("CHILD LAST NAME")  or U.get("STUDENT LAST NAME")  or U.get("LAST NAME")  or U.get("LAST")
     col_grade = U.get("GRADE") or U.get("GRADE LEVEL") or U.get("GR")
-    # If needed, split Student Name
+    # Optionally split Student Name
     if (not col_sf or not col_sl) and ("STUDENT NAME" in U or "STUDENT_NAME" in U or "NAME" in U):
         name_col = U.get("STUDENT NAME") or U.get("STUDENT_NAME") or U.get("NAME")
         def split_student_name(val: str):
