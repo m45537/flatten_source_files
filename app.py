@@ -2,6 +2,17 @@ import io, re
 import pandas as pd
 import streamlit as st
 
+# Put near the top after imports
+APP_VERSION = "lenient-v2: surname_last_token + BB 3+ token fix"
+
+st.info(f"Build: {APP_VERSION}")
+
+with st.expander("Diagnostics"):
+    st.markdown("""
+    - Keying: **LAST surname token + normalized grade**
+    - BB parsing: **no-comma names with ≥3 tokens → last=first token; first=rest**
+    """)
+
 # ------------------------------
 # App config
 # ------------------------------
